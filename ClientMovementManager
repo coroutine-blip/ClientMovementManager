@@ -1,5 +1,4 @@
--- Discord User: ayaaya0709
--- Roblox User: CoroutineLib
+-- Credit: [Your Discord Username] | [Your Roblox Username]
 --!strict
 
 --[[
@@ -476,6 +475,8 @@ function ClientMovementManager:_BindMovementLoop(character: Model)
 		-- Only flag as falling if velocity is sufficiently negative AND we are
 		-- not mid-jump, preventing a false positive at the apex of a jump.
 		local isFallingNow = velocity.Y < FALL_THRESHOLD and not isOnFloor and not isJumping
+		and not self._isRolling
+	
 		if isFallingNow ~= states.IsFalling then
 			states.IsFalling = isFallingNow
 			if isFallingNow then
@@ -644,6 +645,7 @@ function ClientMovementManager:_ExecuteRoll(worldDirection: Vector3)
 	local humanoid = self._humanoid :: Humanoid
 
 	self._isRolling = true
+	self._tilt.Enabled = false
 
 	-- Face the roll direction before locking AutoRotate
 	humanoid.AutoRotate = false
@@ -675,7 +677,7 @@ function ClientMovementManager:_ExecuteRoll(worldDirection: Vector3)
 
 	self._rollAttachment = attachment
 	self._rollConstraint = linearVelocity
-
+	
 	-- Schedule cleanup; cancellation routes to _EndRoll(immediate=true)
 	self._rollPromise = Promise.delay(ROLL_DURATION)
 		:andThen(function()
@@ -692,6 +694,7 @@ end
 -- the cooldown Promise unless `immediate` is true (cancelled/death case).
 function ClientMovementManager:_EndRoll(immediate: boolean?)
 	self._isRolling = false
+	self._tilt.Enabled = true
 
 	if self._rollConstraint then
 		self._rollConstraint:Destroy()
@@ -706,6 +709,7 @@ function ClientMovementManager:_EndRoll(immediate: boolean?)
 		self._humanoid.WalkSpeed  = self._savedWalkSpeed or DEFAULT_WALKSPEED
 		self._humanoid.AutoRotate = true
 	end
+	
 	self._savedWalkSpeed = nil
 
 	self._animationsManager:StopAnimation(MOVEMENT_FAMILY, "Rolling")
@@ -741,6 +745,8 @@ function ClientMovementManager:_DetachRoll()
 		self._humanoid.AutoRotate = true
 	end
 	self._savedWalkSpeed = nil
+
+	self._tilt.Enabled = true
 
 	self._rollPromise = nil
 	self._isRolling   = false
