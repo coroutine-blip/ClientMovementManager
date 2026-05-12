@@ -1,6 +1,6 @@
 # ClientMovementManager
 
-A fully client-sided character movement controller built in Roblox Luau, focused on clean architecture, responsive gameplay feel, and scalable state-driven movement handling.
+A fully client-sided character movement controller built in Luau, focused on clean architecture, responsive feel, and scalable state-driven movement handling.
 
 This system manages:
 
