@@ -172,5 +172,5 @@ The demonstration place showcases https://www.roblox.com/games/105482781630126/M
 
 # Author
 
-Discord: `brickcolour`
+Discord: `ayaaya0709`
 Roblox: `CoroutineLib`
