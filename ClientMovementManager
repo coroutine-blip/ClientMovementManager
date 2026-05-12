@@ -1,0 +1,782 @@
+-- Discord User: ayaaya0709
+-- Roblox User: CoroutineLib
+--!strict
+
+--[[
+	ClientMovementManager
+	A self-contained client-side movement system for a character.
+
+	Architecture overview:
+	
+	This module owns two distinct responsibilities that are tightly coupled,
+	so they live together rather than in separate files:
+
+	  1. Movement management - tracks IsMoving / IsJumping / IsFalling / IsSprinting
+	                            state, drives animation transitions, and applies a
+	                            camera-relative character tilt via CFrame math.
+
+	  2. Roll controller - detects double-tap input (W/A/S/D), translates the
+	                            local key direction into a world-space roll vector
+	                            using the camera's CFrame, then drives the character
+	                            forward using a LinearVelocity constraint for the
+	                            duration of the roll.
+
+	Lifecycle:
+	
+	  New()  → constructs the manager (no side-effects yet)
+	  Start() → kicks off _CharacterLifecycleLoop(), a Promise chain that:
+	              - waits for a living character
+	              - binds the heartbeat loop & input listeners
+	              - waits for the humanoid to die
+	              - tears down bindings
+	              - waits for the next character and loops
+
+	  Two Trove instances are used so that character-specific cleanup (_charTrove)
+	  can be performed independently of the top-level manager lifetime (_trove).
+	  This prevents stale connections accumulating across respawns.
+--]]
+
+--// Services
+local Players           = game:GetService("Players")
+local RunService        = game:GetService("RunService")
+local UserInputService  = game:GetService("UserInputService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+--// Packages
+local Packages = ReplicatedStorage.Packages
+local Promise  = require(Packages.Promise)
+local Trove    = require(Packages.Trove)
+local Knit     = require(Packages.Knit)
+
+--// Constants
+
+local MOVEMENT_FAMILY = "MovementFamily"
+
+-- How long after a jump input we suppress IsFalling to avoid flickering
+local JUMP_COOLDOWN   = 0.3
+
+-- Y-velocity below this while airborne triggers the Falling state
+local FALL_THRESHOLD  = -5
+
+-- MoveDirection magnitude below this is treated as "not moving"
+local MOVE_THRESHOLD  = 0.1
+
+-- Sprinting auto-cancels after this many seconds to prevent indefinite speed
+local SPRINT_MAX_DURATION = 5
+local DEFAULT_WALKSPEED   = 16
+local SPRINT_WALKSPEED    = 20
+
+-- Two taps of the same key within this window (seconds) triggers a roll
+local DOUBLE_TAP_WINDOW = 0.35
+
+-- Total time the roll physics constraint is active
+local ROLL_DURATION     = 0.55
+
+-- Minimum time between rolls so the player can't spam them
+local ROLL_COOLDOWN     = 0.8
+
+-- How far (studs) the character travels during a roll; combined with
+-- ROLL_DURATION this defines the force: speed = ROLL_DISTANCE / ROLL_DURATION
+local ROLL_DISTANCE     = 10
+
+-- Maps WASD keys to their local-space direction vectors (Y is always 0).
+-- These are camera-relative, not world-relative; the roll code transforms
+-- them into world space using the camera's CFrame before applying force.
+local KEY_DIRECTIONS: { [Enum.KeyCode]: Vector3 } = {
+	[Enum.KeyCode.W] = Vector3.new( 0, 0, -1),
+	[Enum.KeyCode.S] = Vector3.new( 0, 0,  1),
+	[Enum.KeyCode.A] = Vector3.new(-1, 0,  0),
+	[Enum.KeyCode.D] = Vector3.new( 1, 0,  0),
+}
+
+--// Types
+type PlayerStates = {
+	IsMoving: boolean,
+	IsJumping: boolean,
+	IsFalling: boolean,
+	WasOnFloor: boolean,
+	IsSprinting: boolean,
+}
+
+type TiltConfig = {
+	Enabled: boolean,
+	MaxTiltAngle: number,   -- degrees
+	TiltSmoothness: number,   -- lerp factor denominator; lower = smoother
+	CurrentTilt: CFrame,
+}
+
+-- Tracks the timestamp of the most recent tap for a given key so we can
+-- detect whether the next tap falls within DOUBLE_TAP_WINDOW
+type LastTapRecord = {
+	Time: number,
+}
+ 
+--// Constructor 
+
+local ClientMovementManager = {}
+ClientMovementManager.__index = ClientMovementManager
+
+function ClientMovementManager.New(
+	animationsManager: any
+)
+	local self = setmetatable({}, ClientMovementManager)
+
+	self._player    = Players.LocalPlayer
+	self._character = nil :: Model?
+
+	self._animationsManager = animationsManager
+
+	-- _trove lives for the entire manager lifetime.
+	-- _charTrove is cleaned and rebuilt every time the character respawns,
+	-- ensuring RunService and UserInputService connections don't stack up.
+	self._trove     = Trove.new()
+	self._charTrove = Trove.new()
+
+	self._playerStates = {
+		IsMoving    = false,
+		IsJumping   = false,
+		IsFalling   = false,
+		WasOnFloor  = false,
+		IsSprinting = false,
+	} :: PlayerStates
+
+	-- Tilt config; CurrentTilt accumulates each frame and is lerped toward
+	-- CFrame.identity (upright) when the player stops moving.
+	self._tilt = {
+		Enabled = true,
+		MaxTiltAngle = 12,
+		TiltSmoothness = 0.15,
+		CurrentTilt = CFrame.identity,
+	} :: TiltConfig
+
+	--  Roll state 
+	-- These fields replace a separate RollController module; keeping them
+	-- here avoids an extra require and makes the roll logic easy to follow
+	-- in context with the movement states it interacts with.
+
+	self._isRolling      = false
+	self._onCooldown     = false
+	self._rollPromise    = nil :: typeof(Promise.new(function() end))?
+	self._rollConstraint = nil :: LinearVelocity?
+	self._rollAttachment = nil :: Attachment?
+	self._savedWalkSpeed = nil :: number?
+	self._lastTap = {} :: { [Enum.KeyCode]: LastTapRecord }
+
+	-- The humanoid and root part references are cached when a character
+	-- spawns so roll helpers don't need to search the hierarchy every frame
+	self._humanoid = nil :: Humanoid?
+	self._rootPart = nil :: BasePart?
+
+	self._animationsManager:RegisterAnimationSet(MOVEMENT_FAMILY)
+
+	return self
+end
+
+--// Public - Lifecycle Entry Point
+
+-- Called once by the controller after KnitStart.
+-- Delegates immediately to the internal character lifecycle loop.
+function ClientMovementManager:Start()
+	self._charDetection = self:_CharacterLifecycleLoop()
+end
+
+--// Private - Character Lifecycle Loop
+
+--[[
+	_CharacterLifecycleLoop
+	
+	A recursive Promise chain that keeps movement running across respawns
+	without any polling or while-true loops on the main thread.
+
+	Flow per iteration:
+	  1. _WaitForCharacterAndBind - finds the current character, resets state, and starts the heartbeat loop.
+	  2. Humanoid.Died - waits passively; no busy-wait.
+	  3. _TeardownCharacter - cancels rolls, cleans connections.
+	  4. CharacterAdded - waits for the next character.
+	  5. Tail-recurse back to #1.
+--]]
+function ClientMovementManager:_CharacterLifecycleLoop(): typeof(Promise.new(function() end))
+	local function loop()
+		return self:_WaitForCharacterAndBind()
+			:andThen(function()
+				return Promise.new(function(resolve)
+					local character = self._character
+					if not character then resolve() return end
+
+					local humanoid = character:FindFirstChildOfClass("Humanoid")
+					if humanoid then
+						local conn
+						conn = humanoid.Died:Connect(function()
+							conn:Disconnect()
+							resolve()
+						end)
+					else
+						resolve()
+					end
+				end)
+			end)
+			:andThen(function()
+				self:_TeardownCharacter()
+
+				-- Passively await the next character instead of checking
+				-- player.Character in a loop, keeping the thread free.
+				return Promise.new(function(resolve)
+					local player = self._player
+					if player.Character
+						and player.Character:FindFirstChildOfClass("Humanoid")
+						and player.Character:FindFirstChildOfClass("Humanoid").Health > 0
+					then
+						resolve()
+					else
+						local conn
+						conn = player.CharacterAdded:Connect(function()
+							conn:Disconnect()
+							resolve()
+						end)
+					end
+				end)
+			end)
+			:andThen(function()
+				if self._trove then
+					return loop()
+				end
+			end)
+			:catch(function(err)
+				warn(`lifecycle error: {tostring(err)}`)
+			end)
+	end
+
+	return loop()
+end
+
+ 
+--// Private - Wait For Character And Bind
+
+function ClientMovementManager:_WaitForCharacterAndBind(): typeof(Promise.new(function() end))
+	return Promise.new(function(resolve, reject)
+		local player    = self._player
+		local character = player.Character or player.CharacterAdded:Wait()
+		
+		if not character then
+			reject("No character found")
+			return
+		end
+
+		self._character = character
+		self:_ResetAllState()
+
+		-- Stop any lingering animations left over from the previous life
+		for _, animName in { "Walk", "Running", "Jump", "Falling", "Landing", "Rolling" } do
+			self._animationsManager:StopAnimation(MOVEMENT_FAMILY, animName)
+		end
+
+		self:_BindMovementLoop(character)
+
+		local humanoid = character:FindFirstChildOfClass("Humanoid")
+		if humanoid then
+			humanoid.WalkSpeed = DEFAULT_WALKSPEED
+		end
+
+		resolve()
+	end)
+end
+
+--// Private - Reset All State
+
+-- Wipes all transient state so a fresh character starts with a clean slate.
+-- Called before binding to a new character and on explicit teardown.
+function ClientMovementManager:_ResetAllState()
+	self._playerStates = {
+		IsMoving    = false,
+		IsJumping   = false,
+		IsFalling   = false,
+		WasOnFloor  = false,
+		IsSprinting = false,
+	}
+
+	self._tilt.CurrentTilt = CFrame.identity
+
+	-- Roll state
+	self._isRolling      = false
+	self._onCooldown     = false
+	self._savedWalkSpeed = nil
+	table.clear(self._lastTap)
+
+	if self._rollPromise and self._rollPromise:getStatus() == Promise.Status.Started then
+		self._rollPromise:cancel()
+	end
+	self._rollPromise    = nil
+	self._rollConstraint = nil
+	self._rollAttachment = nil
+
+	-- Wipe character-scoped connections so they don't fire for the new body
+	self._charTrove:Clean()
+end
+ 
+--// Private - Per-Character Teardown
+
+function ClientMovementManager:_TeardownCharacter()
+	-- If a roll is in progress when the character dies, cancel its Promise
+	-- and destroy the LinearVelocity so it doesn't linger on the corpse.
+	self:_DetachRoll()
+	self._charTrove:Clean()
+	self._character = nil
+	self._humanoid  = nil
+	self._rootPart  = nil
+end
+
+--// Private - Movement Heartbeat Loop
+
+--[[
+	_BindMovementLoop
+	
+	Sets up all per-character connections inside _charTrove so they are
+	automatically disconnected on the next _TeardownCharacter call.
+
+	State machine overview (runs every Heartbeat):
+	  • IsMoving    - toggled by MoveDirection magnitude vs MOVE_THRESHOLD
+	  • IsSprinting - toggled by LeftControl; auto-cancelled after
+	                  SPRINT_MAX_DURATION or when jumping
+	  • IsJumping   - set when HumanoidStateType == Jumping; cleared once
+	                  the character lands or JUMP_COOLDOWN elapses
+	  • IsFalling   - set when Y velocity < FALL_THRESHOLD while airborne
+	                  and not in a jump; triggers a Landing animation on exit
+	  • WasOnFloor  - mirrors the previous floor state for transition checks
+--]]
+function ClientMovementManager:_BindMovementLoop(character: Model)
+	self._charTrove:Clean()
+
+	local humanoidRootPart = character:WaitForChild("HumanoidRootPart") :: BasePart
+	local humanoid = character:FindFirstChildOfClass("Humanoid") :: Humanoid
+
+	if not humanoidRootPart or not humanoid then
+		warn("Missing HRP or Humanoid")
+		return
+	end
+
+	-- Cache references on self so roll helpers can access them without
+	-- searching the hierarchy on every input event
+	self._humanoid = humanoid
+	self._rootPart = humanoidRootPart
+
+	humanoid.WalkSpeed = DEFAULT_WALKSPEED
+
+	local states= self._playerStates
+	local lastJumpTime  = 0
+	local sprintStartTime = 0
+	local isAlive = true
+
+	-- Track death locally to short-circuit heartbeat work early
+	self._charTrove:Add(humanoid.Died:Connect(function()
+		isAlive = false
+	end))
+
+	--  Sprint helpers 
+
+	local function startSprint()
+		if not isAlive then return end
+		if states.IsSprinting then return end
+		-- Only start sprinting if the player is already providing movement input
+		if humanoid.MoveDirection.Magnitude > 0 then
+			states.IsSprinting = true
+			sprintStartTime = os.clock()
+			humanoid.WalkSpeed = SPRINT_WALKSPEED
+			self._animationsManager:PlayAnimation(MOVEMENT_FAMILY, "Running")
+		end
+	end
+
+	local function stopSprint()
+		if not states.IsSprinting then return end
+		states.IsSprinting = false
+		humanoid.WalkSpeed = DEFAULT_WALKSPEED
+		self._animationsManager:StopAnimation(MOVEMENT_FAMILY, "Running")
+	end
+
+	--  Sprint input 
+
+	self._charTrove:Add(UserInputService.InputBegan:Connect(function(input: InputObject, gameProcessed: boolean)
+		if gameProcessed then return end
+		if not isAlive then return end
+		if input.KeyCode == Enum.KeyCode.LeftControl then
+			startSprint()
+		end
+	end))
+
+	self._charTrove:Add(UserInputService.InputEnded:Connect(function(input: InputObject)
+		if input.KeyCode == Enum.KeyCode.LeftControl then
+			stopSprint()
+		end
+	end))
+
+	--  Roll double-tap input 
+	-- Registered here (inside charTrove) so it is cleaned up on respawn.
+	-- The detection logic lives in _OnKeyPressed below.
+
+	self._charTrove:Add(UserInputService.InputBegan:Connect(function(input: InputObject, gameProcessed: boolean)
+		if gameProcessed then return end
+		if not isAlive then return end
+		self:_OnKeyPressed(input.KeyCode)
+	end))
+
+	--  Main Heartbeat 
+
+	self._charTrove:Add(RunService.Heartbeat:Connect(function(deltaTime: number)
+		if not isAlive then return end
+
+		-- While rolling, skip normal movement processing to avoid fighting
+		-- the roll force with walking animation or sprint logic.
+		-- We still apply camera tilt so it doesn't snap when the roll ends.
+		if self._isRolling then
+			self:_ApplyMovementTilt(humanoid, humanoidRootPart, deltaTime)
+			return
+		end
+
+		local moveDir   = humanoid.MoveDirection
+		local velocity  = humanoidRootPart.AssemblyLinearVelocity
+		local isOnFloor = humanoid.FloorMaterial ~= Enum.Material.Air
+		local isJumping = humanoid:GetState() == Enum.HumanoidStateType.Jumping
+
+		--  Movement 
+		local isMovingNow = moveDir.Magnitude > MOVE_THRESHOLD
+		if isMovingNow ~= states.IsMoving then
+			states.IsMoving = isMovingNow
+			if isMovingNow then
+				self._animationsManager:PlayAnimation(MOVEMENT_FAMILY, "Walk")
+			else
+				self._animationsManager:StopAnimation(MOVEMENT_FAMILY, "Walk")
+			end
+		end
+
+		--  Sprint cap 
+		-- Prevents indefinite sprinting by forcing a cooldown after the
+		-- maximum sprint duration has elapsed.
+		if states.IsSprinting then
+			if (os.clock() - sprintStartTime) >= SPRINT_MAX_DURATION then
+				stopSprint()
+			end
+		end
+
+		--  Jumping 
+		if isJumping and not states.IsJumping then
+			states.IsJumping = true
+			lastJumpTime     = os.clock()
+			self._animationsManager:PlayAnimation(MOVEMENT_FAMILY, "Jump")
+			-- Sprinting while airborne looks odd and makes landing feel floaty
+			stopSprint()
+		elseif states.IsJumping then
+			-- Clear jumping state once back on the floor OR after the cooldown
+			-- window has passed (handles cases where FloorMaterial lags behind)
+			local timeSinceJump = os.clock() - lastJumpTime
+			if isOnFloor or (not isOnFloor and timeSinceJump > JUMP_COOLDOWN) then
+				states.IsJumping = false
+			end
+		end
+
+		--  Falling 
+		-- Only flag as falling if velocity is sufficiently negative AND we are
+		-- not mid-jump, preventing a false positive at the apex of a jump.
+		local isFallingNow = velocity.Y < FALL_THRESHOLD and not isOnFloor and not isJumping
+		if isFallingNow ~= states.IsFalling then
+			states.IsFalling = isFallingNow
+			if isFallingNow then
+				self._animationsManager:PlayAnimation(MOVEMENT_FAMILY, "Falling")
+			else
+				-- Transition: was falling, now landing
+				self._animationsManager:StopAnimation(MOVEMENT_FAMILY, "Falling")
+				self._animationsManager:PlayAnimation(MOVEMENT_FAMILY, "Landing")
+			end
+		end
+
+		--  Floor transition 
+		if isOnFloor ~= states.WasOnFloor then
+			states.WasOnFloor = isOnFloor
+		end
+
+		--  Camera tilt 
+		self:_ApplyMovementTilt(humanoid, humanoidRootPart, deltaTime)
+	end))
+end
+
+--// 
+--// Private - Camera Tilt
+--// 
+
+--[[
+	_ApplyMovementTilt
+	
+	Rotates the HumanoidRootPart slightly in the direction of travel to give
+	the character a sense of weight and momentum.
+
+	Implementation:
+	  1. Project the world-space MoveDirection into camera-local space using
+	     VectorToObjectSpace so the tilt is always relative to where the
+	     camera is looking, not the character's facing direction.
+	  2. Build a CFrame.Angles tilt from the local X and Z components:
+	       - tiltX tilts forward/backward (pitch): driven by localMove.Z.
+	         Z is positive when moving away from the camera (backward in
+	         camera space), so we keep the sign as-is. Moving forward
+	         (negative Z) tilts the character's top toward the camera (forward lean).
+	       - tiltZ tilts left/right (roll): driven by -localMove.X so strafing
+	         right rolls the character to the right.
+	  3. Lerp CurrentTilt toward the target each frame; the lerp factor is
+	     clamped to [0,1] so large delta-times don't overshoot.
+	  4. Multiply root.CFrame by CurrentTilt to apply as a local rotation,
+	     preserving position and the base facing direction.
+--]]
+function ClientMovementManager:_ApplyMovementTilt(
+	humanoid:  Humanoid,
+	root:      BasePart,
+	deltaTime: number
+)
+	local tilt = self._tilt
+	if not tilt.Enabled then return end
+
+	local moveDir = humanoid.MoveDirection
+	local camera  = workspace.CurrentCamera
+	if not camera then return end
+
+	if moveDir.Magnitude < 0.05 then
+		-- Smoothly return to upright when the player stops moving
+		tilt.CurrentTilt = tilt.CurrentTilt:Lerp(
+			CFrame.identity,
+			math.clamp(deltaTime * 8, 0, 1)
+		)
+	else
+		local localMove = camera.CFrame:VectorToObjectSpace(moveDir)
+		local maxAngle  = math.rad(tilt.MaxTiltAngle)
+
+		-- localMove.Z is negative when moving forward in camera space.
+		-- We keep it without negation so forward movement produces a
+		-- negative tiltX, which tilts the character's top forward
+		local tiltX = math.clamp(localMove.Z, -1, 1) * maxAngle
+		local tiltZ = math.clamp(-localMove.X, -1, 1) * maxAngle
+
+		tilt.CurrentTilt = tilt.CurrentTilt:Lerp(
+			CFrame.Angles(tiltX, 0, tiltZ),
+			math.clamp(deltaTime / tilt.TiltSmoothness, 0, 1)
+		)
+	end
+
+	-- Apply tilt as a local-space offset so it doesn't disturb world position
+	root.CFrame = root.CFrame * tilt.CurrentTilt
+end
+
+--// Private - Roll: Double-Tap Detection
+
+--[[
+	_OnKeyPressed
+	
+	Called on every InputBegan that passes the gameProcessed check.
+	Maintains a per-key timestamp table (_lastTap). On each press:
+	  - If the same key was pressed within DOUBLE_TAP_WINDOW seconds,
+	    it shall consume the record and attempt a roll.
+	  - Otherwise, record the current time for the next press to compare.
+--]]
+function ClientMovementManager:_OnKeyPressed(keyCode: Enum.KeyCode)
+	local direction = KEY_DIRECTIONS[keyCode]
+	if not direction then return end
+
+	local now  = os.clock()
+	local last = self._lastTap[keyCode]
+
+	if last and (now - last.Time) <= DOUBLE_TAP_WINDOW then
+		self._lastTap[keyCode] = nil
+		self:_TryRoll(direction)
+	else
+		self._lastTap[keyCode] = { Time = now }
+	end
+end
+
+--// Private - Roll: Attempt
+
+--[[
+	_TryRoll
+	
+	Guards against rolling while already rolling, on cooldown, airborne,
+	or while the humanoid is dead. If all guards pass, it converts the
+	key's local-space direction into a world-space vector using the camera's
+	CFrame (LookVector for forward/back, RightVector for strafing) and
+	delegates to _ExecuteRoll.
+--]]
+function ClientMovementManager:_TryRoll(localDirection: Vector3)
+	if self._isRolling then return end
+	if self._onCooldown then return end
+	if not self._rootPart or not self._humanoid then return end
+	if self._humanoid.Health <= 0 then return end
+	-- Prevent air-rolls; FloorMaterial == Air means the character is airborne
+	if self._humanoid.FloorMaterial == Enum.Material.Air then return end
+
+	local camera   = workspace.CurrentCamera
+	local camFlat  = Vector3.new(camera.CFrame.LookVector.X,  0, camera.CFrame.LookVector.Z).Unit
+	local camRight = Vector3.new(camera.CFrame.RightVector.X, 0, camera.CFrame.RightVector.Z).Unit
+
+	-- Combine the flat camera vectors weighted by the local key direction so
+	-- W rolls forward relative to the camera, A rolls left, and so on.
+	local worldDirection = (
+		camFlat  * (-localDirection.Z) +
+			camRight * ( localDirection.X)
+	).Unit
+
+	self:_ExecuteRoll(worldDirection)
+end
+
+--// Private - Roll: Execution
+
+--[[
+	_ExecuteRoll
+	
+	Drives the character through a roll using a LinearVelocity constraint
+	rather than BodyVelocity (deprecated) or direct CFrame manipulation.
+
+	Steps:
+	  1. Snap the root's CFrame to face the roll direction so the character
+	     visually faces where it's rolling.
+	  2. Disable AutoRotate so Roblox's default turning doesn't fight us.
+	  3. Zero WalkSpeed so player input can't redirect the roll mid-way.
+	  4. Attach a LinearVelocity constraint (requires an Attachment anchor)
+	     set to the roll speed for exactly ROLL_DURATION seconds.
+	  5. Use Promise.delay to clean up automatically; if the Promise is
+	     cancelled (e.g. character dies mid-roll), _EndRoll(immediate=true)
+	     skips the cooldown so the player isn't punished for dying.
+--]]
+function ClientMovementManager:_ExecuteRoll(worldDirection: Vector3)
+	local rootPart = self._rootPart :: BasePart
+	local humanoid = self._humanoid :: Humanoid
+
+	self._isRolling = true
+
+	-- Face the roll direction before locking AutoRotate
+	humanoid.AutoRotate = false
+	local flatDir   = Vector3.new(worldDirection.X, 0, worldDirection.Z).Unit
+	rootPart.CFrame = CFrame.lookAt(rootPart.Position, rootPart.Position + flatDir)
+
+	-- Save current WalkSpeed so we restore it correctly even if sprinting
+	self._savedWalkSpeed = humanoid.WalkSpeed
+	humanoid.WalkSpeed   = 0
+
+	self._animationsManager:PlayAnimation(MOVEMENT_FAMILY, "Rolling")
+
+	-- speed = distance ÷ time; apply only on the XZ plane to respect gravity
+	local speed = ROLL_DISTANCE / ROLL_DURATION
+	local rollVelocity = Vector3.new(flatDir.X * speed, 0, flatDir.Z * speed)
+
+	local attachment = Instance.new("Attachment")
+	attachment.Name   = "RollAttachment"
+	attachment.Parent = rootPart
+
+	local linearVelocity = Instance.new("LinearVelocity")
+	linearVelocity.Name = "RollVelocity"
+	linearVelocity.Attachment0 = attachment
+	linearVelocity.VelocityConstraintMode = Enum.VelocityConstraintMode.Vector
+	linearVelocity.VectorVelocity = rollVelocity
+	linearVelocity.MaxForce = math.huge  -- override any physics resistance
+	linearVelocity.RelativeTo = Enum.ActuatorRelativeTo.World
+	linearVelocity.Parent = rootPart
+
+	self._rollAttachment = attachment
+	self._rollConstraint = linearVelocity
+
+	-- Schedule cleanup; cancellation routes to _EndRoll(immediate=true)
+	self._rollPromise = Promise.delay(ROLL_DURATION)
+		:andThen(function()
+			self:_EndRoll(false)
+		end)
+		:catch(function()
+			self:_EndRoll(true)
+		end)
+end
+
+--// Private - Roll: End
+
+-- Destroys the physics constraint, restores humanoid defaults, and starts
+-- the cooldown Promise unless `immediate` is true (cancelled/death case).
+function ClientMovementManager:_EndRoll(immediate: boolean?)
+	self._isRolling = false
+
+	if self._rollConstraint then
+		self._rollConstraint:Destroy()
+		self._rollConstraint = nil
+	end
+	if self._rollAttachment then
+		self._rollAttachment:Destroy()
+		self._rollAttachment = nil
+	end
+
+	if self._humanoid then
+		self._humanoid.WalkSpeed  = self._savedWalkSpeed or DEFAULT_WALKSPEED
+		self._humanoid.AutoRotate = true
+	end
+	self._savedWalkSpeed = nil
+
+	self._animationsManager:StopAnimation(MOVEMENT_FAMILY, "Rolling")
+
+	if immediate then return end
+
+	-- Start cooldown so the player cannot chain rolls back-to-back
+	self._onCooldown  = true
+	self._rollPromise = Promise.delay(ROLL_COOLDOWN):andThen(function()
+		self._onCooldown  = false
+		self._rollPromise = nil
+	end)
+end
+
+--// Private - Roll: Full Detach (used on teardown / death)
+
+function ClientMovementManager:_DetachRoll()
+	if self._rollPromise and self._rollPromise:getStatus() == Promise.Status.Started then
+		self._rollPromise:cancel()
+	end
+
+	if self._rollConstraint then
+		self._rollConstraint:Destroy()
+		self._rollConstraint = nil
+	end
+	if self._rollAttachment then
+		self._rollAttachment:Destroy()
+		self._rollAttachment = nil
+	end
+
+	if self._humanoid and self._savedWalkSpeed then
+		self._humanoid.WalkSpeed  = self._savedWalkSpeed
+		self._humanoid.AutoRotate = true
+	end
+	self._savedWalkSpeed = nil
+
+	self._rollPromise = nil
+	self._isRolling   = false
+	self._onCooldown  = false
+end
+
+--// Public - State Queries
+
+function ClientMovementManager:IsRolling(): boolean
+	return self._isRolling
+end
+
+function ClientMovementManager:IsSprinting(): boolean
+	return self._playerStates.IsSprinting
+end
+
+function ClientMovementManager:IsMoving(): boolean
+	return self._playerStates.IsMoving
+end
+
+function ClientMovementManager:IsJumping(): boolean
+	return self._playerStates.IsJumping
+end
+
+function ClientMovementManager:IsFalling(): boolean
+	return self._playerStates.IsFalling
+end
+
+--// Public - Lifecycle
+
+-- Full teardown: cancel any active roll, destroy all trove-managed objects.
+-- After this the instance should not be used.
+function ClientMovementManager:Destroy()
+	self:_TeardownCharacter()
+	self._trove:Destroy()
+	self._trove = nil
+end
+
+return ClientMovementManager
