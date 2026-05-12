@@ -13,7 +13,7 @@ This system manages:
 * Character lifecycle handling across respawns
 * Automatic cleanup through Trove
 
-The module was designed with maintainability and scalability in mind, avoiding polling loops and stale connections while keeping gameplay responsive and deterministic.
+The module was designed with maintainability and scalability in mind, avoiding polling loops and stale connections while keeping gameplay responsive and deterministic. It is used projects of mine, like my combat game system.
 
 ---
 
